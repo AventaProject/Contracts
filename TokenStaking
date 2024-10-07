@@ -1,0 +1,422 @@
+// SPDX-License-Identifier: MIT
+pragma solidity 0.8.24;
+
+contract Context {
+    function _msgSender() internal view virtual returns (address) {
+        return msg.sender;
+    }
+}
+
+interface IERC20 {
+    function balanceOf(address account) external view returns (uint256);
+
+    function transfer(address recipient, uint256 amount)
+        external
+        returns (bool);
+
+    function transferFrom(
+        address sender,
+        address recipient,
+        uint256 amount
+    ) external returns (bool);
+}
+
+abstract contract Pausable is Context {
+    bool private _paused;
+
+    constructor() {
+        _paused = false;
+    }
+
+    function paused() public view virtual returns (bool) {
+        return _paused;
+    }
+
+    modifier whenNotPaused() {
+        require(!_paused, "Pausable: paused");
+        _;
+    }
+
+    function _pause() internal virtual {
+        _paused = true;
+    }
+
+    function _unpause() internal virtual {
+        _paused = false;
+    }
+}
+
+contract Ownable is Context {
+    address private _owner;
+
+    constructor() {
+        _owner = 0x0ceE8381e39f19a72B5091C81A053Fdf01099852;
+    }
+
+    function owner() public view returns (address) {
+        return _owner;
+    }
+
+    modifier onlyOwner() {
+        require(_owner == _msgSender(), "Ownable: caller is not the owner");
+        _;
+    }
+
+    function transferOwnership(address newOwner) public onlyOwner {
+        require(
+            newOwner != address(0),
+            "Ownable: new owner is the zero address"
+        );
+        _owner = newOwner;
+    }
+}
+
+contract Token_Staking is Ownable, Pausable {
+    IERC20 public Token;
+    uint256 public totalStakers;
+    uint256 public totalStaked;
+    uint256 public totallocked;
+
+    struct UserInfo {
+        uint256 planDuration;
+        uint256 amount;
+        uint256 startTime;
+        uint256 endTime;
+        uint256 withdrawn;
+        bool hasHarvested;
+    }
+
+    mapping(address => bool) public isSpam;
+    mapping(address => bool) public newStakers;
+    mapping(uint256 => uint256) public APR_PERCENTAGE;
+    mapping(uint256 => uint256) public TIME_STEP;
+    mapping(address => mapping(uint256 => UserInfo[])) private Users;
+    // Minimum amount required for staking (1 ether = 10^18 wei)
+    uint256 public minStaking = 1 ether;
+    // Maximum amount allowed for staking (60,000 ether = 60,000 * 10^18 wei)
+    uint256 public maxStaking = 60_000 ether;
+    uint256 public deductionPercentage = 25_00; // 25%
+    address public taxReceiver;
+
+    event Farm(
+        address indexed to,
+        address indexed from,
+        uint256 amount,
+        uint256 startTime,
+        uint256 endTime
+    );
+    event Harvest(
+        address indexed user,
+        uint256 amount,
+        uint256 deduction,
+        uint256 planDuration
+    );
+
+    constructor() {
+        Token = IERC20(0x7Fd4Abc178a66E26711658763654A041940C75A9);
+        taxReceiver = owner();
+        // Set APR (Annual Percentage Rate) values for different plan durations
+        APR_PERCENTAGE[14] = 100_41; // 14-day lock: = 0.41%
+        APR_PERCENTAGE[30] = 101_66; // 30-day lock: = 1.66%
+        APR_PERCENTAGE[60] = 105_00; // 60-day lock: = 5 %
+        APR_PERCENTAGE[90] = 112_50; // 90-day lock: = 12.5%
+
+        // Set time steps for dividend calculations for each plan duration
+        TIME_STEP[14] = 14 days; // Time step for 14-day plan
+        TIME_STEP[30] = 30 days; // Time step for 30-day plan
+        TIME_STEP[60] = 60 days; // Time step for 60-day plan
+        TIME_STEP[90] = 90 days; // Time step for 90-day plan
+    }
+
+    function farm(uint256 _amount, uint256 _lockableDays)
+        external
+        whenNotPaused
+    {
+        require(!isSpam[msg.sender], "Account is spam!");
+        require(_amount >= minStaking, "Amount below minimum staking");
+        require(_amount <= maxStaking, "Amount above maximum staking");
+        require(APR_PERCENTAGE[_lockableDays] > 0, "Invalid day selection");
+        uint256 lockableDays = TIME_STEP[_lockableDays];
+
+        Token.transferFrom(msg.sender, address(this), _amount);
+
+        if (!newStakers[msg.sender]) {
+            totalStakers++;
+            newStakers[msg.sender] = true;
+        }
+
+        UserInfo memory newDeposit = UserInfo({
+            planDuration: _lockableDays,
+            amount: _amount,
+            startTime: block.timestamp,
+            endTime: block.timestamp + lockableDays,
+            withdrawn: 0,
+            hasHarvested: false
+        });
+
+        Users[msg.sender][_lockableDays].push(newDeposit);
+
+        totalStaked += _amount;
+
+        emit Farm(
+            msg.sender,
+            address(this),
+            _amount,
+            block.timestamp,
+            block.timestamp + lockableDays
+        );
+    }
+
+    function harvest(uint256 planDuration, uint256 index)
+        external
+        whenNotPaused
+    {
+        require(!isSpam[msg.sender], "Account is spam!");
+
+        uint256 totalHarvestedAmount;
+        uint256 totalDeduction;
+
+        UserInfo[] storage userDeposits = Users[msg.sender][planDuration];
+
+        require(index < userDeposits.length, "Invalid deposit index");
+
+        UserInfo storage deposit = userDeposits[index];
+        require(!deposit.hasHarvested, "Already harvested for this deposit");
+
+        uint256 harvestAmount;
+
+        if (block.timestamp < deposit.endTime) {
+            uint256 deduction = (deposit.amount * deductionPercentage) / 100_00;
+            harvestAmount = deposit.amount - deduction;
+            totalDeduction += deduction;
+        } else {
+            harvestAmount = getUserDividends(msg.sender, planDuration, index);
+        }
+
+        deposit.withdrawn += harvestAmount + totalDeduction;
+        deposit.hasHarvested = true;
+        totalHarvestedAmount += harvestAmount;
+
+        emit Harvest(msg.sender, harvestAmount, totalDeduction, planDuration);
+
+        Token.transfer(msg.sender, totalHarvestedAmount);
+
+        if (totalDeduction > 0) {
+            Token.transfer(taxReceiver, totalDeduction);
+        }
+    }
+
+    function getUserDividends(
+        address _user,
+        uint256 _planDuration,
+        uint256 index
+    ) public view returns (uint256 totalDividends) {
+        UserInfo[] storage userDeposits = Users[_user][_planDuration];
+
+        if (
+            userDeposits.length == 0 ||
+            index >= userDeposits.length ||
+            userDeposits[index].hasHarvested
+        ) {
+            return 0;
+        }
+
+        UserInfo storage selectedDeposit = userDeposits[index];
+        uint256 timeElapsed = block.timestamp - selectedDeposit.startTime;
+        uint256 maxDividends = (selectedDeposit.amount *
+            APR_PERCENTAGE[_planDuration]) / 100_00;
+
+        if (block.timestamp < selectedDeposit.endTime) {
+            totalDividends =
+                (selectedDeposit.amount *
+                    APR_PERCENTAGE[_planDuration] *
+                    timeElapsed) /
+                (100_00 * TIME_STEP[_planDuration]);
+        } else {
+            totalDividends = maxDividends;
+        }
+
+        if (selectedDeposit.withdrawn + totalDividends > maxDividends) {
+            totalDividends = maxDividends - selectedDeposit.withdrawn;
+        }
+
+        return totalDividends;
+    }
+
+    function futureRewards(address _add, uint256 _lockableDays)
+        public
+        view
+        returns (uint256 reward, uint256 claimedAmount)
+    {
+        uint256 Reward = 0;
+        uint256 apyPercent = APR_PERCENTAGE[_lockableDays];
+        uint256 claimed = 0;
+
+        for (uint256 z = 0; z < Users[_add][_lockableDays].length; z++) {
+            UserInfo memory user = Users[_add][_lockableDays][z];
+            uint256 elapsedTime = block.timestamp - user.startTime;
+
+            uint256 totalAPR = apyPercent;
+            uint256 maxAmount = (user.amount * totalAPR) / 100_00;
+            uint256 currentReward;
+            if (block.timestamp < user.endTime) {
+                currentReward =
+                    (user.amount * totalAPR * elapsedTime) /
+                    (100_00 * TIME_STEP[_lockableDays]);
+            } else {
+                currentReward = maxAmount;
+            }
+            uint256 unclaimedReward = currentReward > user.withdrawn
+                ? currentReward - user.withdrawn
+                : 0;
+            Reward += unclaimedReward;
+            claimed += user.withdrawn;
+        }
+
+        return (Reward, claimed);
+    }
+
+    function getUserStakedPlans(address userAddress)
+        external
+        view
+        returns (uint256[] memory)
+    {
+        UserInfo[] storage userDeposits;
+        uint256 maxPlans = 90;
+        bool[] memory hasStakedPlan = new bool[](maxPlans + 1);
+
+        for (uint256 i = 0; i <= maxPlans; i++) {
+            userDeposits = Users[userAddress][i];
+            if (userDeposits.length > 0) {
+                hasStakedPlan[i] = true;
+            }
+        }
+
+        uint256 stakedPlanCount = 0;
+        for (uint256 i = 0; i <= maxPlans; i++) {
+            if (hasStakedPlan[i]) {
+                stakedPlanCount++;
+            }
+        }
+
+        uint256[] memory uniquePlans = new uint256[](stakedPlanCount);
+        uint256 index = 0;
+        for (uint256 i = 0; i <= maxPlans; i++) {
+            if (hasStakedPlan[i]) {
+                uniquePlans[index] = i;
+                index++;
+            }
+        }
+
+        return uniquePlans;
+    }
+
+    function getUserStakesCount(address userAddress, uint256 planDuration)
+        external
+        view
+        returns (uint256 stakeCount)
+    {
+        UserInfo[] storage userDeposits = Users[userAddress][planDuration];
+        stakeCount = userDeposits.length;
+    }
+
+    function getUserDepositInfo(
+        address userAddress,
+        uint256 planDuration,
+        uint256 index
+    )
+        external
+        view
+        returns (
+            uint256 _planDuration,
+            uint256 amount,
+            uint256 withdrawn,
+            uint256 start,
+            uint256 end,
+            bool hasHarvested
+        )
+    {
+        UserInfo[] memory userDeposits = Users[userAddress][planDuration];
+        UserInfo memory deposit = userDeposits[index];
+
+        return (
+            deposit.planDuration,
+            deposit.amount,
+            deposit.withdrawn,
+            deposit.startTime,
+            deposit.endTime,
+            deposit.hasHarvested
+        );
+    }
+
+    function withdrawTokens(address _tokenAddress, uint256 _amount)
+        external
+        onlyOwner
+    {
+        require(_tokenAddress != address(0), "Invalid token address");
+        require(_amount > 0, "Amount must be greater than zero");
+
+        IERC20 token = IERC20(_tokenAddress);
+        uint256 contractBalance = token.balanceOf(address(this));
+        require(_amount <= contractBalance, "Insufficient contract balance");
+
+        token.transfer(msg.sender, _amount);
+    }
+
+    function withdrawETH() external onlyOwner {
+        uint256 balance = address(this).balance;
+        require(balance > 0, "No ETH to withdraw");
+        payable(owner()).transfer(balance);
+    }
+
+    function setTaxReceiver(address _taxReceiver) external onlyOwner {
+        taxReceiver = _taxReceiver;
+    }
+
+    function updateStakingLimits(uint256 _min, uint256 _max)
+        external
+        onlyOwner
+    {
+        minStaking = _min;
+        maxStaking = _max;
+    }
+
+    function setDeductionPercentage(uint256 _deductionPercentage)
+        external
+        onlyOwner
+    {
+        deductionPercentage = _deductionPercentage;
+    }
+
+    function setPlanAPR(uint256 _planDuration, uint256 _aprPercentage)
+        external
+        onlyOwner
+    {
+        APR_PERCENTAGE[_planDuration] = _aprPercentage;
+    }
+
+    function setPlanTimeStep(uint256 _planDuration, uint256 _timeStep)
+        external
+        onlyOwner
+    {
+        TIME_STEP[_planDuration] = _timeStep;
+    }
+
+    function pause() external onlyOwner {
+        _pause();
+    }
+
+    function unpause() external onlyOwner {
+        _unpause();
+    }
+
+    function setSpamStatus(address _address, bool _status) external onlyOwner {
+        isSpam[_address] = _status;
+    }
+
+    function setToken(IERC20 _token) external onlyOwner {
+        Token = _token;
+    }
+
+    receive() external payable {}
+}
